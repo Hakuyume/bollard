@@ -1,13 +1,16 @@
 use futures_util::FutureExt;
 use hyper_util::rt::TokioIo;
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
-#[derive(Clone)]
-pub(crate) struct SshConnector;
+#[derive(Clone, Default)]
+pub(crate) struct SshConnector {
+    pool: Arc<Mutex<HashMap<http::uri::Authority, Weak<openssh::Session>>>>,
+}
 
 pub(crate) struct SshStream {
     _child: openssh::Child<Arc<openssh::Session>>,
@@ -26,6 +29,7 @@ impl tower_service::Service<hyper::Uri> for SshConnector {
     }
 
     fn call(&mut self, destination: hyper::Uri) -> Self::Future {
+        let pool = self.pool.clone();
         async move {
             let authority = match destination.scheme() {
                 Some(scheme) if scheme == "ssh" => destination.authority().ok_or_else(|| {
@@ -38,10 +42,32 @@ impl tower_service::Service<hyper::Uri> for SshConnector {
             }
             .map_err(openssh::Error::Connect)?;
 
-            let builder = openssh::SessionBuilder::default();
-            let (builder, destination) = builder.resolve(authority.as_str());
-            let tempdir = builder.launch_master(destination).await?;
-            let session = Arc::new(openssh::Session::new_process_mux(tempdir));
+            let session = {
+                let mut pool = pool.lock().unwrap();
+                // garbage collection
+                pool.retain(|_, session| session.strong_count() > 0);
+                pool.get(authority).and_then(Weak::upgrade)
+            };
+
+            // check if the session is alive
+            let session = if let Some(session) = session {
+                session.check().await.is_ok().then_some(session)
+            } else {
+                None
+            };
+
+            let session = if let Some(session) = session {
+                session
+            } else {
+                let builder = openssh::SessionBuilder::default();
+                let (builder, destination) = builder.resolve(authority.as_str());
+                let tempdir = builder.launch_master(destination).await?;
+                let session = Arc::new(openssh::Session::new_process_mux(tempdir));
+                pool.lock()
+                    .unwrap()
+                    .insert(authority.clone(), Arc::downgrade(&session));
+                session
+            };
 
             let mut child = session
                 .arc_command("docker")

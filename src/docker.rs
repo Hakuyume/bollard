@@ -1117,7 +1117,7 @@ impl Docker {
     ) -> Result<Docker, Error> {
         let client_addr = addr.replacen("ssh://", "", 1);
 
-        let ssh_connector = crate::ssh::SshConnector;
+        let ssh_connector = crate::ssh::SshConnector::default();
 
         let client_builder = Client::builder(TokioExecutor::new());
 
